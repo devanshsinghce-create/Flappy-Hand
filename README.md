@@ -40,7 +40,7 @@ An interactive browser-based game inspired by Flappy Bird, controlled using real
 ## ▶️ How to Run
 
 1. Clone the repository:
-   git clone https://github.com/your-username/flappy-hand-ai.git
+   git clone https://github.com/devanshsinghce-create/Flappy-Hand
 
 2. Open the project folder
 
