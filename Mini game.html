@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Flappy Hand – AI Edition</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { background:#000; font-family:'Segoe UI',sans-serif; overflow:hidden; height:100vh; }
+        #game-container { position:relative; width:100vw; height:100vh; }
+        canvas { display:block; width:100%; height:100%; }
+
+        #webcam-feed {
+            position:absolute; bottom:12px; right:12px;
+            width:160px; height:120px;
+            border:2px solid rgba(255,255,255,0.5);
+            border-radius:10px;
+            transform:scaleX(-1);
+            opacity:0.8; z-index:10;
+        }
+
+        #overlay {
+            position:absolute; top:0; left:0; width:100%; height:100%;
+            background:rgba(0,0,0,0.82);
+            display:flex; flex-direction:column;
+            justify-content:center; align-items:center;
+            color:#fff; z-index:20; text-align:center; gap:10px;
+        }
+        #overlay h1 { font-size:48px; color:#f4ce42; text-shadow:0 0 20px #f4ce42aa; margin:0; }
+        #overlay .stats { font-size:19px; color:#eee; line-height:1.8; }
+        #overlay .hint { font-size:14px; color:#6cf; margin-top:8px; }
+        #overlay .badge {
+            background:rgba(255,255,255,0.07);
+            border:1px solid rgba(255,255,255,0.13);
+            border-radius:14px; padding:16px 32px;
+        }
+
+        #toast {
+            position:absolute; top:95px; left:50%;
+            transform:translateX(-50%);
+            font-size:28px; font-weight:800;
+            color:#fff; text-shadow:0 2px 8px #000;
+            pointer-events:none; z-index:15;
+            opacity:0; transition:opacity 0.15s;
+            white-space:nowrap;
+        }
+
+        #debug {
+            position:absolute; bottom:138px; right:12px;
+            color:#0f0; font-size:11px; z-index:15;
+            background:rgba(0,0,0,0.5); padding:4px 7px; border-radius:5px;
+        }
+        .hidden { display:none !important; }
+        video { display:none; }
+    </style>
+</head>
+<body>
+<div id="game-container">
+    <canvas id="gameCanvas"></canvas>
+    <canvas id="webcam-feed" width="160" height="120"></canvas>
+    <div id="debug">Loading...</div>
+    <div id="toast"></div>
+    <div id="overlay">
+        <h1>✋ FLAPPY HAND</h1>
+        <p style="color:#aaa;font-size:14px">AI Edition</p>
+        <div class="badge">
+            <p style="color:#aaa;font-size:13px;">🎥 Allow camera access to play</p>
+            <p style="color:#aaa;font-size:13px;margin-top:4px;">✋ Raise hand above head to start</p>
+        </div>
+    </div>
+    <video id="input_video"></video>
+</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const webcamCanvas = document.getElementById('webcam-feed');
+const webcamCtx = webcamCanvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const toastEl = document.getElementById('toast');
+const debugDiv = document.getElementById('debug');
+const inputVideo = document.getElementById('input_video');
+
+// ─── State ────────────────────────────────────────────────
+let gameRunning = false, loopStarted = false;
+let score = 0, level = 1, combo = 0, lives = 3, coins = 0;
+let highScore = +localStorage.getItem('fh_high') || 0;
+let highLevel  = +localStorage.getItem('fh_hlvl') || 0;
+let totalCoins = +localStorage.getItem('fh_coins') || 0;
+let gameSpeed = 2, spawnRate = 100, pipeGap = 160, lerpSpeed = 0.15;
+let frameCount = 0, levelUpAnim = 0, toastTimer = 0;
+let shieldActive = false, shieldTimer = 0, invincTimer = 0;
+let inWave = false, waveTimer = 0;
+let handDetected = false;
+let gameScale = 1, PIPE_WIDTH = 60;
+
+// ─── Entities ─────────────────────────────────────────────
+let bird = { x:110, y:320, radius:18, targetY:320 };
+let pipes = [], coinItems = [], powerUps = [], particles = [], clouds = [];
+
+// ─── Audio ────────────────────────────────────────────────
+let audioCtx = null;
+function getAudio() { if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)(); return audioCtx; }
+function tone(freq, dur, vol=0.15, type='sine') {
+    try {
+        const a = getAudio(), o = a.createOscillator(), g = a.createGain();
+        o.type = type; o.frequency.value = freq;
+        o.connect(g); g.connect(a.destination);
+        g.gain.setValueAtTime(vol, a.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+        o.start(a.currentTime); o.stop(a.currentTime + dur);
+    } catch(e){}
+}
+function playCoin()   { tone(880,0.08,0.14,'square'); setTimeout(()=>tone(1200,0.08,0.1,'square'),70); }
+function playShield() { tone(440,0.2,0.18,'sine'); tone(660,0.2,0.14,'sine'); }
+function playHit()    { tone(180,0.22,0.28,'sawtooth'); }
+function playLevelUp(){ [500,650,850,1100].forEach((f,i)=>setTimeout(()=>tone(f,0.1,0.15,'square'),i*75)); }
+function playDie()    { [280,180,90].forEach((f,i)=>setTimeout(()=>tone(f,0.15,0.28,'sawtooth'),i*90)); }
+
+// ─── Resize ───────────────────────────────────────────────
+function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    gameScale  = canvas.height / 640;
+    PIPE_WIDTH = 60 * gameScale;
+    bird.radius = 18 * gameScale;
+    bird.x = 110 * gameScale;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ─── Helpers ──────────────────────────────────────────────
+function roundRect(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x+r,y); c.lineTo(x+w-r,y);
+    c.arcTo(x+w,y,x+w,y+r,r); c.lineTo(x+w,y+h-r);
+    c.arcTo(x+w,y+h,x+w-r,y+h,r); c.lineTo(x+r,y+h);
+    c.arcTo(x,y+h,x,y+h-r,r); c.lineTo(x,y+r);
+    c.arcTo(x,y,x+r,y,r); c.closePath();
+}
+
+function burst(x, y, color, n=12) {
+    for (let i=0; i<n; i++) {
+        const ang = Math.random()*Math.PI*2, spd=(1+Math.random()*4)*gameScale;
+        particles.push({ x, y, vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd,
+            life:45, maxLife:45, color, r:(2+Math.random()*4)*gameScale });
+    }
+}
+
+function showToast(msg, color='#fff') {
+    toastEl.textContent = msg; toastEl.style.color = color;
+    toastEl.style.opacity = '1'; toastTimer = 85;
+}
+
+// ─── Clouds ───────────────────────────────────────────────
+function makeClouds() {
+    clouds = [];
+    for (let i=0; i<9; i++) clouds.push({
+        x: Math.random()*canvas.width,
+        y: Math.random()*canvas.height*0.6,
+        r: (35+Math.random()*55)*gameScale,
+        spd: (0.25+Math.random()*0.45)*gameScale,
+        alpha: 0.05 + Math.random()*0.12
+    });
+}
+
+// ─── Reset ────────────────────────────────────────────────
+function resetGame() {
+    resize();
+    bird.y = canvas.height/2; bird.targetY = bird.y;
+    pipes=[]; coinItems=[]; powerUps=[]; particles=[];
+    score=0; level=1; combo=0; lives=3; coins=0;
+    gameSpeed=2; spawnRate=100;
+    pipeGap=160*gameScale; lerpSpeed=0.15;
+    frameCount=0; levelUpAnim=0; toastTimer=0;
+    inWave=false; waveTimer=0;
+    shieldActive=false; shieldTimer=0; invincTimer=0;
+    gameRunning=true;
+    makeClouds();
+    overlay.classList.add('hidden');
+    toastEl.style.opacity='0';
+}
+
+// ─── Game Over ────────────────────────────────────────────
+function gameOver() {
+    gameRunning=false; playDie();
+    burst(bird.x, bird.y, '#f4ce42', 22);
+    if (score>highScore) { highScore=score; localStorage.setItem('fh_high',highScore); }
+    if (level>highLevel) { highLevel=level;  localStorage.setItem('fh_hlvl',highLevel); }
+    totalCoins+=coins; localStorage.setItem('fh_coins',totalCoins);
+    overlay.innerHTML=`
+        <h1>💀 GAME OVER</h1>
+        <div class="badge">
+            <div class="stats">
+                Score <b style="color:#f4ce42">${score}</b> &nbsp;·&nbsp; Level <b style="color:#6cf">${level}</b><br>
+                🪙 <b style="color:#ffd700">${coins}</b> coins &nbsp;·&nbsp; 🔥 Best combo <b style="color:#f80">x${combo}</b>
+            </div>
+            <hr style="border:none;border-top:1px solid rgba(255,255,255,0.1);margin:10px 0">
+            <div class="stats" style="font-size:15px;color:#aaa">
+                🏆 High Score <b style="color:#fff">${highScore}</b> &nbsp;·&nbsp; Best Level <b style="color:#fff">${highLevel}</b><br>
+                🪙 All-time coins <b style="color:#ffd700">${totalCoins}</b>
+            </div>
+        </div>
+        <p class="hint">✋ Raise hand above head to play again</p>
+    `;
+    overlay.classList.remove('hidden');
+}
+
+// ─── Level params ─────────────────────────────────────────
+function updateParams() {
+    const newLevel = Math.floor(score/10)+1;
+    if (newLevel > level) {
+        level = newLevel;
+        spawnRate = Math.max(52, 100-(level-1)*4);
+        pipeGap   = Math.max(108, 160-Math.floor((level-1)/3)*10)*gameScale;
+        lerpSpeed = Math.min(0.34, 0.15+(level-1)*0.02);
+        playLevelUp();
+        showToast('LEVEL '+level+'! 🚀','#f4ce42');
+        levelUpAnim=70;
+        burst(canvas.width/2, canvas.height/2,'#f4ce42',25);
+    }
+    if (level>=5 && level%5===0 && !inWave) {
+        inWave=true; waveTimer=1500;
+        spawnRate=Math.max(36, spawnRate*0.6);
+        pipeGap=112*gameScale;
+        showToast('⚡ DANGER WAVE!','#f44'); playLevelUp();
+    }
+    if (inWave && --waveTimer<=0) {
+        inWave=false; score+=30;
+        spawnRate=Math.max(52,100-(level-1)*4);
+        pipeGap=Math.max(108,160-Math.floor((level-1)/3)*10)*gameScale;
+        showToast('+30 WAVE BONUS! 🎉','#0f0');
+    }
+}
+
+// ─── Update ───────────────────────────────────────────────
+function update() {
+    if (!gameRunning) return;
+    updateParams();
+
+    // Bird
+    if (handDetected) {
+        bird.targetY = Math.max(28*gameScale, Math.min(canvas.height-48*gameScale, bird.targetY));
+        bird.y += (bird.targetY-bird.y)*lerpSpeed;
+    } else {
+        bird.y += 1.5*gameScale;
+    }
+
+    // Clouds scroll
+    for (const c of clouds) {
+        c.x -= c.spd;
+        if (c.x+c.r<0) { c.x=canvas.width+c.r; c.y=Math.random()*canvas.height*0.62; }
+    }
+
+    // Particles
+    for (let i=particles.length-1; i>=0; i--) {
+        const p=particles[i];
+        p.x+=p.vx; p.y+=p.vy; p.vy+=0.12; p.life--;
+        if (p.life<=0) particles.splice(i,1);
+    }
+
+    if (toastTimer>0 && --toastTimer===0) toastEl.style.opacity='0';
+    if (invincTimer>0) invincTimer--;
+    if (shieldActive && --shieldTimer<=0) { shieldActive=false; showToast('Shield gone!','#aaa'); }
+
+    frameCount++;
+
+    // Spawn pipe
+    if (frameCount%spawnRate===0) {
+        const minY=90*gameScale, maxY=canvas.height-90*gameScale-pipeGap;
+        const gapTop=Math.floor(Math.random()*(maxY-minY)+minY);
+        pipes.push({ x:canvas.width, gapTop, passed:false });
+        if (Math.random()<0.45) coinItems.push({ x:canvas.width+PIPE_WIDTH/2, y:gapTop+pipeGap/2, r:10*gameScale, done:false, t:0 });
+        if (Math.random()<0.12) powerUps.push({ x:canvas.width+PIPE_WIDTH*1.6, y:gapTop+pipeGap/2, r:13*gameScale, done:false, t:0 });
+    }
+
+    // Pipes
+    for (let i=pipes.length-1; i>=0; i--) {
+        const p=pipes[i];
+        p.x -= gameSpeed;
+        // Collision
+        if (bird.x+bird.radius>p.x && bird.x-bird.radius<p.x+PIPE_WIDTH) {
+            if (bird.y-bird.radius<p.gapTop || bird.y+bird.radius>p.gapTop+pipeGap) {
+                if (invincTimer<=0) {
+                    if (shieldActive) {
+                        shieldActive=false; shieldTimer=0; invincTimer=60;
+                        showToast('🛡 Shield blocked!','#4af');
+                        burst(bird.x,bird.y,'#4af',16); playShield();
+                    } else {
+                        lives--; playHit(); burst(bird.x,bird.y,'#f44',15);
+                        invincTimer=90; combo=0;
+                        if (lives<=0) { gameOver(); return; }
+                        showToast('💥 -1 Life!','#f44');
+                        bird.y=canvas.height/2; bird.targetY=bird.y;
+                    }
+                }
+            }
+        }
+        // Score
+        if (p.x+PIPE_WIDTH<bird.x && !p.passed) {
+            score++; p.passed=true; combo++;
+            if (score%5===0) gameSpeed=Math.min(7, gameSpeed+0.15);
+            if (combo>=5 && combo%5===0) {
+                const b=combo>=20?5:combo>=10?3:2;
+                score+=b;
+                showToast(`🔥 ${combo} COMBO! +${b}`,'#f80');
+                burst(bird.x,bird.y,'#f80',10);
+            }
+        }
+        if (p.x+PIPE_WIDTH<0) pipes.splice(i,1);
+    }
+
+    // Coins
+    for (let i=coinItems.length-1; i>=0; i--) {
+        const c=coinItems[i]; c.x-=gameSpeed; c.t+=0.1;
+        if (!c.done && Math.hypot(bird.x-c.x,bird.y-c.y)<bird.radius+c.r) {
+            c.done=true; coins++; score++;
+            playCoin(); burst(c.x,c.y,'#ffd700',8);
+            showToast('+1 🪙','#ffd700');
+        }
+        if (c.x<-20||c.done) coinItems.splice(i,1);
+    }
+
+    // Power-ups
+    for (let i=powerUps.length-1; i>=0; i--) {
+        const pu=powerUps[i]; pu.x-=gameSpeed; pu.t+=0.05;
+        if (!pu.done && Math.hypot(bird.x-pu.x,bird.y-pu.y)<bird.radius+pu.r) {
+            pu.done=true; shieldActive=true; shieldTimer=300;
+            playShield(); burst(pu.x,pu.y,'#4af',16);
+            showToast('🛡 Shield ON! (5s)','#4af');
+        }
+        if (pu.x<-20||pu.done) powerUps.splice(i,1);
+    }
+
+    // Ceiling/floor
+    if ((bird.y-bird.radius<0||bird.y+bird.radius>canvas.height-18*gameScale) && invincTimer<=0) {
+        lives--; playHit(); invincTimer=90; combo=0;
+        if (lives<=0) { gameOver(); return; }
+        bird.y=canvas.height/2; bird.targetY=bird.y;
+        showToast('💥 -1 Life!','#f44');
+    }
+}
+
+// ─── Draw ─────────────────────────────────────────────────
+function draw() {
+    const W=canvas.width, H=canvas.height;
+
+    // Sky
+    const sky=ctx.createLinearGradient(0,0,0,H);
+    if (inWave) { sky.addColorStop(0,'#220000'); sky.addColorStop(1,'#7a1010'); }
+    else        { sky.addColorStop(0,'#0d1b3e'); sky.addColorStop(1,'#1a5fa8'); }
+    ctx.fillStyle=sky; ctx.fillRect(0,0,W,H);
+
+    // Clouds
+    ctx.save();
+    for (const c of clouds) {
+        ctx.globalAlpha=c.alpha; ctx.fillStyle='#fff';
+        ctx.beginPath();
+        ctx.arc(c.x,      c.y,          c.r,     0,Math.PI*2);
+        ctx.arc(c.x+c.r*.6, c.y-c.r*.3, c.r*.62, 0,Math.PI*2);
+        ctx.arc(c.x-c.r*.5, c.y-c.r*.2, c.r*.52, 0,Math.PI*2);
+        ctx.fill();
+    }
+    ctx.globalAlpha=1; ctx.restore();
+
+    // Pipes
+    for (const p of pipes) {
+        const px=p.x;
+        // gradient fill
+        const pg=ctx.createLinearGradient(px,0,px+PIPE_WIDTH,0);
+        if (inWave) { pg.addColorStop(0,'#7a0000'); pg.addColorStop(0.5,'#cc2200'); pg.addColorStop(1,'#7a0000'); }
+        else        { pg.addColorStop(0,'#1a7a1a'); pg.addColorStop(0.5,'#3ec83e'); pg.addColorStop(1,'#1a7a1a'); }
+        ctx.fillStyle=pg;
+
+        // top pipe body
+        ctx.beginPath(); roundRect(ctx,px,0,PIPE_WIDTH,p.gapTop,[0,0,5,5]); ctx.fill();
+        // top pipe cap
+        ctx.fillRect(px-5*gameScale, p.gapTop-16*gameScale, PIPE_WIDTH+10*gameScale, 16*gameScale);
+
+        // bottom pipe body
+        const by=p.gapTop+pipeGap;
+        ctx.beginPath(); roundRect(ctx,px,by,PIPE_WIDTH,H-by-16*gameScale,[5,5,0,0]); ctx.fill();
+        // bottom pipe cap
+        ctx.fillRect(px-5*gameScale, by, PIPE_WIDTH+10*gameScale, 16*gameScale);
+
+        // shine
+        ctx.fillStyle='rgba(255,255,255,0.1)';
+        ctx.fillRect(px+5*gameScale, 0, 7*gameScale, p.gapTop);
+        ctx.fillRect(px+5*gameScale, by, 7*gameScale, H-by);
+    }
+
+    // Ground
+    ctx.fillStyle='#4a8c1c'; ctx.fillRect(0,H-18*gameScale,W,5*gameScale);
+    const gg=ctx.createLinearGradient(0,H-13*gameScale,0,H);
+    gg.addColorStop(0,'#8B6914'); gg.addColorStop(1,'#5a4000');
+    ctx.fillStyle=gg; ctx.fillRect(0,H-13*gameScale,W,13*gameScale);
+
+    // Coins
+    for (const c of coinItems) {
+        ctx.save();
+        ctx.translate(c.x, c.y+Math.sin(c.t)*4*gameScale);
+        ctx.shadowColor='#ffd700'; ctx.shadowBlur=14;
+        ctx.beginPath(); ctx.arc(0,0,c.r,0,Math.PI*2);
+        ctx.fillStyle='#ffd700'; ctx.fill();
+        ctx.fillStyle='rgba(255,255,180,0.55)';
+        ctx.beginPath(); ctx.arc(-c.r*.25,-c.r*.25,c.r*.35,0,Math.PI*2); ctx.fill();
+        ctx.shadowBlur=0; ctx.fillStyle='#a06800';
+        ctx.font=`bold ${c.r*1.3}px sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText('$',0,1);
+        ctx.restore();
+    }
+
+    // Power-ups (shield orbs)
+    for (const pu of powerUps) {
+        ctx.save();
+        ctx.translate(pu.x, pu.y+Math.sin(pu.t)*5*gameScale);
+        const pulse=0.8+0.2*Math.sin(frameCount*.15);
+        ctx.shadowColor='#4af'; ctx.shadowBlur=20*pulse;
+        ctx.beginPath(); ctx.arc(0,0,pu.r,0,Math.PI*2);
+        ctx.fillStyle='rgba(0,160,255,0.22)'; ctx.fill();
+        ctx.strokeStyle='#4af'; ctx.lineWidth=2.5*gameScale; ctx.stroke();
+        ctx.font=`${pu.r*1.5}px sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText('🛡',0,2);
+        ctx.restore();
+    }
+
+    // Particles
+    for (const p of particles) {
+        ctx.save();
+        ctx.globalAlpha=p.life/p.maxLife;
+        ctx.fillStyle=p.color;
+        ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+    }
+
+    // ── Bird ──────────────────────────────────────────────
+    const tilt=Math.max(-0.45,Math.min(0.45,(bird.y-bird.targetY)/120));
+    ctx.save();
+    ctx.translate(bird.x, bird.y);
+    ctx.rotate(tilt*0.4);
+
+    // Shield bubble
+    if (shieldActive) {
+        ctx.save();
+        const p=0.82+0.18*Math.sin(frameCount*.18);
+        ctx.globalAlpha=0.3*p;
+        ctx.beginPath(); ctx.arc(0,0,bird.radius*1.75,0,Math.PI*2);
+        ctx.fillStyle='#4af'; ctx.fill();
+        ctx.globalAlpha=0.65;
+        ctx.strokeStyle='#4af'; ctx.lineWidth=2*gameScale; ctx.stroke();
+        ctx.restore();
+    }
+
+    // Invincibility flicker
+    if (invincTimer>0 && Math.floor(invincTimer/5)%2===1) ctx.globalAlpha=0.25;
+
+    // Shadow
+    ctx.save(); ctx.globalAlpha=0.2;
+    ctx.beginPath(); ctx.ellipse(2*gameScale,bird.radius*0.9,bird.radius*0.8,bird.radius*0.3,0,0,Math.PI*2);
+    ctx.fillStyle='#000'; ctx.fill();
+    ctx.restore();
+
+    // Body
+    ctx.shadowColor='rgba(0,0,0,0.35)'; ctx.shadowBlur=8;
+    const bg=ctx.createRadialGradient(-4,-4,2,0,0,bird.radius);
+    bg.addColorStop(0,handDetected?'#fff08a':'#ffd040');
+    bg.addColorStop(1,handDetected?'#e0a800':'#c07000');
+    ctx.beginPath(); ctx.arc(0,0,bird.radius,0,Math.PI*2);
+    ctx.fillStyle=bg; ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,0.4)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.shadowBlur=0;
+
+    // Wing
+    ctx.fillStyle=handDetected?'#f0c000':'#d08000';
+    ctx.beginPath();
+    ctx.ellipse(-bird.radius*.15, bird.radius*.35, bird.radius*.58, bird.radius*.25, tilt*1.8+0.35, 0, Math.PI*2);
+    ctx.fill();
+
+    // Eye white
+    ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.arc(bird.radius*.4,-bird.radius*.28,bird.radius*.35,0,Math.PI*2); ctx.fill();
+    // Pupil
+    ctx.fillStyle='#111';
+    ctx.beginPath(); ctx.arc(bird.radius*.52,-bird.radius*.26,bird.radius*.17,0,Math.PI*2); ctx.fill();
+    // Glint
+    ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.arc(bird.radius*.58,-bird.radius*.32,bird.radius*.07,0,Math.PI*2); ctx.fill();
+
+    // Beak
+    ctx.fillStyle='#f70';
+    ctx.beginPath();
+    ctx.moveTo(bird.radius*.72,-bird.radius*.06);
+    ctx.lineTo(bird.radius*1.28,-bird.radius*.12);
+    ctx.lineTo(bird.radius*.72,bird.radius*.22);
+    ctx.closePath(); ctx.fill();
+
+    ctx.restore();
+
+    // ── HUD ───────────────────────────────────────────────
+
+    // Score (center)
+    ctx.save();
+    ctx.font=`bold ${44*gameScale}px 'Segoe UI'`;
+    ctx.textAlign='center'; ctx.textBaseline='top';
+    ctx.fillStyle='rgba(0,0,0,0.35)';
+    ctx.fillText(score, W/2+2, 10*gameScale+2);
+    ctx.fillStyle='#fff';
+    ctx.fillText(score, W/2, 10*gameScale);
+    ctx.restore();
+
+    // Level pill (top-left)
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.5)';
+    roundRect(ctx, 12*gameScale, 12*gameScale, 105*gameScale, 55*gameScale, 10*gameScale); ctx.fill();
+    ctx.fillStyle='#88aacc'; ctx.font=`${10*gameScale}px sans-serif`; ctx.textAlign='left'; ctx.textBaseline='top';
+    ctx.fillText('LEVEL', 22*gameScale, 18*gameScale);
+    ctx.fillStyle='#6cf'; ctx.font=`bold ${26*gameScale}px 'Segoe UI'`;
+    ctx.fillText(level, 22*gameScale, 32*gameScale);
+    ctx.restore();
+
+    // Coins pill (top-right)
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.5)';
+    roundRect(ctx, W-120*gameScale, 12*gameScale, 108*gameScale, 55*gameScale, 10*gameScale); ctx.fill();
+    ctx.fillStyle='#aaa'; ctx.font=`${10*gameScale}px sans-serif`; ctx.textAlign='left'; ctx.textBaseline='top';
+    ctx.fillText('COINS', W-110*gameScale, 18*gameScale);
+    ctx.fillStyle='#ffd700'; ctx.font=`bold ${18*gameScale}px 'Segoe UI'`;
+    ctx.fillText('🪙 '+coins, W-110*gameScale, 33*gameScale);
+    ctx.restore();
+
+    // Lives (hearts, below score)
+    ctx.save();
+    ctx.font=`${19*gameScale}px sans-serif`; ctx.textAlign='center'; ctx.textBaseline='top';
+    const heartX = W/2 - 30*gameScale;
+    for (let i=0;i<3;i++) {
+        ctx.globalAlpha = i<lives ? 1 : 0.18;
+        ctx.fillText('❤️', heartX + i*28*gameScale, 58*gameScale);
+    }
+    ctx.restore();
+
+    // Combo badge
+    if (combo>=3) {
+        ctx.save();
+        const p=0.6+0.2*Math.sin(frameCount*.25);
+        ctx.fillStyle=`rgba(255,110,0,${p})`;
+        roundRect(ctx, W/2-62*gameScale, 88*gameScale, 124*gameScale, 24*gameScale, 12*gameScale); ctx.fill();
+        ctx.fillStyle='#fff'; ctx.font=`bold ${13*gameScale}px sans-serif`;
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(`🔥 x${combo} COMBO`, W/2, 100*gameScale);
+        ctx.restore();
+    }
+
+    // Speed bar (bottom-left)
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.45)';
+    roundRect(ctx,12*gameScale,H-52*gameScale,118*gameScale,38*gameScale,8*gameScale); ctx.fill();
+    ctx.fillStyle='#888'; ctx.font=`${10*gameScale}px sans-serif`; ctx.textAlign='left'; ctx.textBaseline='top';
+    ctx.fillText('SPEED  '+gameSpeed.toFixed(1)+'x', 20*gameScale, H-48*gameScale);
+    ctx.fillStyle='rgba(255,255,255,0.12)';
+    ctx.fillRect(20*gameScale, H-34*gameScale, 92*gameScale, 7*gameScale);
+    ctx.fillStyle='#4cf';
+    ctx.fillRect(20*gameScale, H-34*gameScale, (gameSpeed/7)*92*gameScale, 7*gameScale);
+    ctx.restore();
+
+    // Shield timer bar
+    if (shieldActive) {
+        ctx.save();
+        ctx.fillStyle='rgba(0,0,0,0.45)';
+        roundRect(ctx,12*gameScale,H-98*gameScale,118*gameScale,38*gameScale,8*gameScale); ctx.fill();
+        ctx.fillStyle='#4af'; ctx.font=`${10*gameScale}px sans-serif`; ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText('🛡 SHIELD', 20*gameScale, H-94*gameScale);
+        ctx.fillStyle='rgba(255,255,255,0.12)';
+        ctx.fillRect(20*gameScale, H-80*gameScale, 92*gameScale, 7*gameScale);
+        ctx.fillStyle='#4af';
+        ctx.fillRect(20*gameScale, H-80*gameScale, (shieldTimer/300)*92*gameScale, 7*gameScale);
+        ctx.restore();
+    }
+
+    // High score ribbon
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.3)';
+    ctx.fillRect(0,60*gameScale,W,16*gameScale);
+    ctx.fillStyle='rgba(255,255,255,0.3)';
+    ctx.font=`${10*gameScale}px sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(`🏆 Best: ${highScore}  ·  Best Level: ${highLevel}  ·  Total 🪙: ${totalCoins}`, W/2, 68*gameScale);
+    ctx.restore();
+
+    // Wave banner
+    if (inWave) {
+        ctx.save();
+        ctx.fillStyle=`rgba(190,0,0,${0.5+0.18*Math.sin(frameCount*.12)})`;
+        ctx.fillRect(0,H-72*gameScale,W,26*gameScale);
+        ctx.fillStyle='#fff'; ctx.font=`bold ${14*gameScale}px sans-serif`;
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText('⚡ DANGER WAVE — SURVIVE TO EARN +30 BONUS!', W/2, H-59*gameScale);
+        ctx.restore();
+    }
+
+    // Level-up animation
+    if (levelUpAnim>0) {
+        const a=Math.min(1,levelUpAnim/20);
+        ctx.save();
+        ctx.globalAlpha=a; ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.font=`bold ${54*gameScale}px 'Segoe UI'`;
+        ctx.shadowColor='#f4ce42'; ctx.shadowBlur=28;
+        ctx.fillStyle='#f4ce42';
+        ctx.fillText('LEVEL '+level+'! 🚀', W/2, H/2+Math.sin(frameCount*.3)*5*gameScale);
+        ctx.restore();
+        levelUpAnim--;
+    }
+
+    // No-hand warning
+    if (!handDetected && gameRunning) {
+        ctx.save();
+        ctx.fillStyle=`rgba(255,80,80,${0.5+0.3*Math.sin(frameCount*.15)})`;
+        ctx.font=`bold ${14*gameScale}px sans-serif`; ctx.textAlign='center'; ctx.textBaseline='bottom';
+        ctx.fillText('✋ Show your hand to control the bird!', W/2, H-88*gameScale);
+        ctx.restore();
+    }
+}
+
+// ─── Main loop ────────────────────────────────────────────
+function loop() { update(); draw(); requestAnimationFrame(loop); }
+
+// ─── Hand tracking ────────────────────────────────────────
+function onResults(results) {
+    webcamCtx.save();
+    webcamCtx.clearRect(0,0,webcamCanvas.width,webcamCanvas.height);
+    webcamCtx.drawImage(results.image,0,0,webcamCanvas.width,webcamCanvas.height);
+    handDetected=false;
+
+    if (results.multiHandLandmarks?.length>0) {
+        const lm=results.multiHandLandmarks[0];
+        drawConnectors(webcamCtx,lm,HAND_CONNECTIONS,{color:'#00ff88',lineWidth:2});
+        drawLandmarks(webcamCtx,lm,{color:'#ff0055',lineWidth:1,radius:2});
+        const tip=lm[8];
+        bird.targetY=tip.y*canvas.height;
+        handDetected=true;
+
+        if (!overlay.classList.contains('hidden') && tip.y<0.18) {
+            if (!loopStarted) { loopStarted=true; resetGame(); loop(); }
+            else { resetGame(); }
+        }
+    }
+
+    debugDiv.textContent=`✋ ${handDetected?'Hand detected':'No hand'} | Score ${score} | Lvl ${level} | Combo ${combo} | Spd ${gameSpeed.toFixed(1)}`;
+    webcamCtx.restore();
+}
+
+const hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:0.55,minTrackingConfidence:0.5});
+hands.onResults(onResults);
+
+const camera=new Camera(inputVideo,{
+    onFrame:async()=>await hands.send({image:inputVideo}),
+    width:640,height:480
+});
+camera.start().then(()=>{
+    overlay.innerHTML=`
+        <h1>✋ FLAPPY HAND</h1>
+        <p style="color:#aaa;font-size:14px;margin-bottom:4px">AI Hand-Controlled · Powered by MediaPipe</p>
+        <div class="badge">
+            <p style="color:#eee;font-size:15px;line-height:2.1">
+                🪙 Fly through coins for bonus score<br>
+                🛡 Grab blue orbs to activate a shield<br>
+                🔥 Chain pipes for combo multiplier<br>
+                ❤️ You have 3 lives — use them wisely
+            </p>
+        </div>
+        <p class="hint">✋ Raise your hand above your head to begin!</p>
+    `;
+});
+</script>
+</body>
+</html>
