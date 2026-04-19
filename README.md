@@ -31,7 +31,7 @@ An interactive browser-based game inspired by Flappy Bird, controlled using real
 ---
 
 ## 📂 Project Structure
-# Flappy-Hand
+### Flappy-Hand
 - Mini game.html
 - README.md
 - LICENSE
